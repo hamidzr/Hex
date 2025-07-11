@@ -7,13 +7,11 @@
 
 import ComposableArchitecture
 import CoreGraphics
-import Foundation
-import HexCore
+import IOKit
+import IOKit.pwr_mgt
 import Inject
 import SwiftUI
 import WhisperKit
-
-private let transcriptionFeatureLogger = HexLog.transcription
 
 @Reducer
 struct TranscriptionFeature {
@@ -25,11 +23,8 @@ struct TranscriptionFeature {
     var error: String?
     var recordingStartTime: Date?
     var meter: Meter = .init(averagePower: 0, peakPower: 0)
-    var sourceAppBundleID: String?
-    var sourceAppName: String?
+    var assertionID: IOPMAssertionID?
     @Shared(.hexSettings) var hexSettings: HexSettings
-    @Shared(.isRemappingScratchpadFocused) var isRemappingScratchpadFocused: Bool = false
-    @Shared(.modelBootstrapState) var modelBootstrapState: ModelBootstrapState
     @Shared(.transcriptionHistory) var transcriptionHistory: TranscriptionHistory
   }
 
@@ -45,19 +40,16 @@ struct TranscriptionFeature {
     case startRecording
     case stopRecording
 
-    // Cancel/discard flow
-    case cancel   // Explicit cancellation with sound
-    case discard  // Silent discard (too short/accidental)
+    // Cancel entire flow
+    case cancel
 
     // Transcription result flow
-    case transcriptionResult(String, URL)
-    case transcriptionError(Error, URL?)
-
-    // Model availability
-    case modelMissing
+    case transcriptionResult(String)
+    case transcriptionError(Error)
   }
 
   enum CancelID {
+    case delayedRecord
     case metering
     case transcription
   }
@@ -67,9 +59,6 @@ struct TranscriptionFeature {
   @Dependency(\.pasteboard) var pasteboard
   @Dependency(\.keyEventMonitor) var keyEventMonitor
   @Dependency(\.soundEffects) var soundEffect
-  @Dependency(\.sleepManagement) var sleepManagement
-  @Dependency(\.date.now) var now
-  @Dependency(\.transcriptPersistence) var transcriptPersistence
 
   var body: some ReducerOf<Self> {
     Reduce { state, action in
@@ -80,11 +69,9 @@ struct TranscriptionFeature {
         // Starts two concurrent effects:
         // 1) Observing audio meter
         // 2) Monitoring hot key events
-        // 3) Priming the recorder for instant startup
         return .merge(
           startMeteringEffect(),
-          startHotKeyMonitoringEffect(),
-          warmUpRecorderEffect()
+          startHotKeyMonitoringEffect()
         )
 
       // MARK: - Metering
@@ -96,13 +83,13 @@ struct TranscriptionFeature {
       // MARK: - HotKey Flow
 
       case .hotKeyPressed:
-        // If we're transcribing, send a cancel first. Otherwise start recording immediately.
-        // We'll decide later (on release) whether to keep or discard the recording.
+        // If we're transcribing, send a cancel first. Then queue up a
+        // "startRecording" in 200ms if the user keeps holding the hotkey.
         return handleHotKeyPressed(isTranscribing: state.isTranscribing)
 
       case .hotKeyReleased:
-        // If we're currently recording, then stop. Otherwise, just cancel
-        // the delayed "startRecording" effect if we never actually started.
+        // If we’re currently recording, then stop. Otherwise, just cancel
+        // the delayed “startRecording” effect if we never actually started.
         return handleHotKeyReleased(isRecording: state.isRecording)
 
       // MARK: - Recording Flow
@@ -115,30 +102,20 @@ struct TranscriptionFeature {
 
       // MARK: - Transcription Results
 
-      case let .transcriptionResult(result, audioURL):
-        return handleTranscriptionResult(&state, result: result, audioURL: audioURL)
+      case let .transcriptionResult(result):
+        return handleTranscriptionResult(&state, result: result)
 
-      case let .transcriptionError(error, audioURL):
-        return handleTranscriptionError(&state, error: error, audioURL: audioURL)
+      case let .transcriptionError(error):
+        return handleTranscriptionError(&state, error: error)
 
-      case .modelMissing:
-        return .none
-
-      // MARK: - Cancel/Discard Flow
+      // MARK: - Cancel Entire Flow
 
       case .cancel:
-        // Only cancel if we're in the middle of recording, transcribing, or post-processing
+        // Only cancel if we’re in the middle of recording or transcribing
         guard state.isRecording || state.isTranscribing else {
           return .none
         }
         return handleCancel(&state)
-
-      case .discard:
-        // Silent discard for quick/accidental recordings
-        guard state.isRecording else {
-          return .none
-        }
-        return handleDiscard(&state)
       }
     }
   }
@@ -146,9 +123,9 @@ struct TranscriptionFeature {
 
 // MARK: - Effects: Metering & HotKey
 
-private extension TranscriptionFeature {
+extension TranscriptionFeature {
   /// Effect to begin observing the audio meter.
-  func startMeteringEffect() -> Effect<Action> {
+  fileprivate func startMeteringEffect() -> Effect<Action> {
     .run { send in
       for await meter in await recording.observeAudioLevel() {
         await send(.audioLevelUpdated(meter))
@@ -158,184 +135,133 @@ private extension TranscriptionFeature {
   }
 
   /// Effect to start monitoring hotkey events through the `keyEventMonitor`.
-  func startHotKeyMonitoringEffect() -> Effect<Action> {
+  fileprivate func startHotKeyMonitoringEffect() -> Effect<Action> {
     .run { send in
       var hotKeyProcessor: HotKeyProcessor = .init(hotkey: HotKey(key: nil, modifiers: [.option]))
       @Shared(.isSettingHotKey) var isSettingHotKey: Bool
       @Shared(.hexSettings) var hexSettings: HexSettings
 
-      // Handle incoming input events (keyboard and mouse)
-      let token = keyEventMonitor.handleInputEvent { inputEvent in
+      // Handle incoming key events
+      keyEventMonitor.handleKeyEvent { keyEvent in
         // Skip if the user is currently setting a hotkey
         if isSettingHotKey {
+          return false
+        }
+
+        // If Escape is pressed with no modifiers while idle, let’s treat that as `cancel`.
+        if keyEvent.key == .escape, keyEvent.modifiers.isEmpty,
+          hotKeyProcessor.state == .idle
+        {
+          Task { await send(.cancel) }
           return false
         }
 
         // Always keep hotKeyProcessor in sync with current user hotkey preference
         hotKeyProcessor.hotkey = hexSettings.hotkey
         hotKeyProcessor.useDoubleTapOnly = hexSettings.useDoubleTapOnly
-        hotKeyProcessor.minimumKeyTime = hexSettings.minimumKeyTime
 
-        switch inputEvent {
-        case .keyboard(let keyEvent):
-          // If Escape is pressed with no modifiers while idle, let's treat that as `cancel`.
-          if keyEvent.key == .escape, keyEvent.modifiers.isEmpty,
-             hotKeyProcessor.state == .idle
+        // Process the key event
+        switch hotKeyProcessor.process(keyEvent: keyEvent) {
+        case .startRecording:
+          // If double-tap lock is triggered, we start recording immediately
+          if hotKeyProcessor.state == .doubleTapLock {
+            Task { await send(.startRecording) }
+          } else {
+            Task { await send(.hotKeyPressed) }
+          }
+          // If the hotkey is purely modifiers, return false to keep it from interfering with normal usage
+          // But if useDoubleTapOnly is true, always intercept the key
+          return hexSettings.useDoubleTapOnly || keyEvent.key != nil
+
+        case .stopRecording:
+          Task { await send(.hotKeyReleased) }
+          return false  // or `true` if you want to intercept
+
+        case .cancel:
+          Task { await send(.cancel) }
+          return true
+
+        case .none:
+          // If we detect repeated same chord, maybe intercept.
+          if let pressedKey = keyEvent.key,
+            pressedKey == hotKeyProcessor.hotkey.key,
+            keyEvent.modifiers == hotKeyProcessor.hotkey.modifiers
           {
-            Task { await send(.cancel) }
-            return false
-          }
-
-          // Process the key event
-          switch hotKeyProcessor.process(keyEvent: keyEvent) {
-          case .startRecording:
-            // If double-tap lock is triggered, we start recording immediately
-            if hotKeyProcessor.state == .doubleTapLock {
-              Task { await send(.startRecording) }
-            } else {
-              Task { await send(.hotKeyPressed) }
-            }
-            // If the hotkey is purely modifiers, return false to keep it from interfering with normal usage
-            // But if useDoubleTapOnly is true, always intercept the key
-            return hexSettings.useDoubleTapOnly || keyEvent.key != nil
-
-          case .stopRecording:
-            Task { await send(.hotKeyReleased) }
-            return false // or `true` if you want to intercept
-
-          case .cancel:
-            Task { await send(.cancel) }
             return true
-
-          case .discard:
-            Task { await send(.discard) }
-            return false // Don't intercept - let the key chord reach other apps
-
-          case .none:
-            // If we detect repeated same chord, maybe intercept.
-            if let pressedKey = keyEvent.key,
-               pressedKey == hotKeyProcessor.hotkey.key,
-               keyEvent.modifiers == hotKeyProcessor.hotkey.modifiers
-            {
-              return true
-            }
-            return false
           }
-
-        case .mouseClick:
-          // Process mouse click - for modifier-only hotkeys, this may cancel/discard
-          switch hotKeyProcessor.processMouseClick() {
-          case .cancel:
-            Task { await send(.cancel) }
-            return false // Don't intercept the click itself
-          case .discard:
-            Task { await send(.discard) }
-            return false // Don't intercept the click itself
-          case .startRecording, .stopRecording, .none:
-            return false
-          }
+          return false
         }
       }
-
-      defer { token.cancel() }
-
-      await withTaskCancellationHandler {
-        while !Task.isCancelled {
-          try? await Task.sleep(for: .seconds(60))
-        }
-      } onCancel: {
-        token.cancel()
-      }
-    }
-  }
-
-  func warmUpRecorderEffect() -> Effect<Action> {
-    .run { _ in
-      await recording.warmUpRecorder()
     }
   }
 }
 
 // MARK: - HotKey Press/Release Handlers
 
-private extension TranscriptionFeature {
-  func handleHotKeyPressed(isTranscribing: Bool) -> Effect<Action> {
-    // If already transcribing, cancel first. Otherwise start recording immediately.
+extension TranscriptionFeature {
+  fileprivate func handleHotKeyPressed(isTranscribing: Bool) -> Effect<Action> {
     let maybeCancel = isTranscribing ? Effect.send(Action.cancel) : .none
-    let startRecording = Effect.send(Action.startRecording)
-    return .merge(maybeCancel, startRecording)
+
+    // We wait 200ms before actually sending `.startRecording`
+    // so the user can do a quick press => do something else
+    // (like a double-tap).
+    let delayedStart = Effect.run { send in
+      try await Task.sleep(for: .milliseconds(200))
+      await send(Action.startRecording)
+    }
+    .cancellable(id: CancelID.delayedRecord, cancelInFlight: true)
+
+    return .merge(maybeCancel, delayedStart)
   }
 
-  func handleHotKeyReleased(isRecording: Bool) -> Effect<Action> {
-    // Always stop recording when hotkey is released
-    return isRecording ? .send(.stopRecording) : .none
+  fileprivate func handleHotKeyReleased(isRecording: Bool) -> Effect<Action> {
+    if isRecording {
+      // We actually stop if we’re currently recording
+      return .send(.stopRecording)
+    } else {
+      // If not recording yet, just cancel the delayed start
+      return .cancel(id: CancelID.delayedRecord)
+    }
   }
 }
 
 // MARK: - Recording Handlers
 
-private extension TranscriptionFeature {
-  func handleStartRecording(_ state: inout State) -> Effect<Action> {
-    guard state.modelBootstrapState.isModelReady else {
-      return .merge(
-        .send(.modelMissing),
-        .run { _ in soundEffect.play(.cancel) }
-      )
-    }
+extension TranscriptionFeature {
+  fileprivate func handleStartRecording(_ state: inout State) -> Effect<Action> {
     state.isRecording = true
-    let startTime = Date()
-    state.recordingStartTime = startTime
-    
-    // Capture the active application
-    if let activeApp = NSWorkspace.shared.frontmostApplication {
-      state.sourceAppBundleID = activeApp.bundleIdentifier
-      state.sourceAppName = activeApp.localizedName
-    }
-    transcriptionFeatureLogger.notice("Recording started at \(startTime.ISO8601Format())")
+    state.recordingStartTime = Date()
 
     // Prevent system sleep during recording
-    return .run { [sleepManagement, preventSleep = state.hexSettings.preventSystemSleep] send in
-      // Play sound immediately for instant feedback
-      soundEffect.play(.startRecording)
+    if state.hexSettings.preventSystemSleep {
+      preventSystemSleep(&state)
+    }
 
-      if preventSleep {
-        await sleepManagement.preventSleep(reason: "Hex Voice Recording")
-      }
+    return .run { _ in
       await recording.startRecording()
+      await soundEffect.play(.startRecording)
     }
   }
 
-  func handleStopRecording(_ state: inout State) -> Effect<Action> {
+  fileprivate func handleStopRecording(_ state: inout State) -> Effect<Action> {
     state.isRecording = false
-    
-    let stopTime = now
-    let startTime = state.recordingStartTime
-    let duration = startTime.map { stopTime.timeIntervalSince($0) } ?? 0
 
-    let decision = RecordingDecisionEngine.decide(
-      .init(
-        hotkey: state.hexSettings.hotkey,
-        minimumKeyTime: state.hexSettings.minimumKeyTime,
-        recordingStartTime: state.recordingStartTime,
-        currentTime: stopTime
-      )
-    )
+    // Allow system to sleep again by releasing the power management assertion
+    // Always call this, even if the setting is off, to ensure we don’t leak assertions
+    //  (e.g. if the setting was toggled off mid-recording)
+    reallowSystemSleep(&state)
 
-    let startStamp = startTime?.ISO8601Format() ?? "nil"
-    let stopStamp = stopTime.ISO8601Format()
-    let minimumKeyTime = state.hexSettings.minimumKeyTime
-    let hotkeyHasKey = state.hexSettings.hotkey.key != nil
-    transcriptionFeatureLogger.notice(
-      "Recording stopped duration=\(String(format: "%.3f", duration))s start=\(startStamp) stop=\(stopStamp) decision=\(String(describing: decision)) minimumKeyTime=\(String(format: "%.2f", minimumKeyTime)) hotkeyHasKey=\(hotkeyHasKey)"
-    )
+    let durationIsLongEnough: Bool = {
+      guard let startTime = state.recordingStartTime else { return false }
+      return Date().timeIntervalSince(startTime) > state.hexSettings.minimumKeyTime
+    }()
 
-    guard decision == .proceedToTranscription else {
-      // If the user recorded for less than minimumKeyTime and the hotkey is modifier-only,
-      // discard the audio to avoid accidental triggers.
-      transcriptionFeatureLogger.notice("Discarding short recording per decision \(String(describing: decision))")
+    guard durationIsLongEnough && state.hexSettings.hotkey.key == nil else {
+      // If the user recorded for less than minimumKeyTime, just discard
+      // unless the hotkey includes a regular key, in which case, we can assume it was intentional
+      print("Recording was too short, discarding")
       return .run { _ in
-        let url = await recording.stopRecording()
-        try? FileManager.default.removeItem(at: url)
+        _ = await recording.stopRecording()
       }
     }
 
@@ -347,31 +273,25 @@ private extension TranscriptionFeature {
 
     state.isPrewarming = true
 
-    return .run { [sleepManagement] send in
-      // Allow system to sleep again
-      await sleepManagement.allowSleep()
-
-      var audioURL: URL?
+    return .run { send in
       do {
-        soundEffect.play(.stopRecording)
-        let capturedURL = await recording.stopRecording()
-        audioURL = capturedURL
+        await soundEffect.play(.stopRecording)
+        let audioURL = await recording.stopRecording()
 
         // Create transcription options with the selected language
-        // Note: cap concurrency to avoid audio I/O overloads on some Macs
         let decodeOptions = DecodingOptions(
           language: language,
-          detectLanguage: language == nil, // Only auto-detect if no language specified
-          chunkingStrategy: .vad,
+          detectLanguage: language == nil,  // Only auto-detect if no language specified
+          chunkingStrategy: .vad
         )
-        
-        let result = try await transcription.transcribe(capturedURL, model, decodeOptions) { _ in }
-        
-        transcriptionFeatureLogger.notice("Transcribed audio from \(capturedURL.lastPathComponent) to text length \(result.count)")
-        await send(.transcriptionResult(result, capturedURL))
+
+        let result = try await transcription.transcribe(audioURL, model, decodeOptions) { _ in }
+
+        print("Transcribed audio from URL: \(audioURL) to text: \(result)")
+        await send(.transcriptionResult(result))
       } catch {
-        transcriptionFeatureLogger.error("Transcription failed: \(error.localizedDescription)")
-        await send(.transcriptionError(error, audioURL))
+        print("Error transcribing audio: \(error)")
+        await send(.transcriptionError(error))
       }
     }
     .cancellable(id: CancelID.transcription)
@@ -380,172 +300,157 @@ private extension TranscriptionFeature {
 
 // MARK: - Transcription Handlers
 
-private extension TranscriptionFeature {
-  func handleTranscriptionResult(
+extension TranscriptionFeature {
+  fileprivate func handleTranscriptionResult(
     _ state: inout State,
-    result: String,
-    audioURL: URL
+    result: String
   ) -> Effect<Action> {
     state.isTranscribing = false
     state.isPrewarming = false
-
-    // Check for force quit command (emergency escape hatch)
-    if ForceQuitCommandDetector.matches(result) {
-      transcriptionFeatureLogger.fault("Force quit voice command recognized; terminating Hex.")
-      return .run { _ in
-        try? FileManager.default.removeItem(at: audioURL)
-        await MainActor.run {
-          NSApp.terminate(nil)
-        }
-      }
-    }
 
     // If empty text, nothing else to do
     guard !result.isEmpty else {
       return .none
     }
 
+    // Compute how long we recorded
     let duration = state.recordingStartTime.map { Date().timeIntervalSince($0) } ?? 0
 
-    transcriptionFeatureLogger.info("Raw transcription: '\(result)'")
-    let remappings = state.hexSettings.wordRemappings
-    let removalsEnabled = state.hexSettings.wordRemovalsEnabled
-    let removals = state.hexSettings.wordRemovals
-    let modifiedResult: String
-    if state.isRemappingScratchpadFocused {
-      modifiedResult = result
-      transcriptionFeatureLogger.info("Scratchpad focused; skipping word modifications")
-    } else {
-      var output = result
-      if removalsEnabled {
-        let removedResult = WordRemovalApplier.apply(output, removals: removals)
-        if removedResult != output {
-          let enabledRemovalCount = removals.filter(\.isEnabled).count
-          transcriptionFeatureLogger.info("Applied \(enabledRemovalCount) word removal(s)")
-        }
-        output = removedResult
-      }
-      let remappedResult = WordRemappingApplier.apply(output, remappings: remappings)
-      if remappedResult != output {
-        transcriptionFeatureLogger.info("Applied \(remappings.count) word remapping(s)")
-      }
-      modifiedResult = remappedResult
-    }
-
-    guard !modifiedResult.isEmpty else {
-      return .none
-    }
-
-    let sourceAppBundleID = state.sourceAppBundleID
-    let sourceAppName = state.sourceAppName
-    let transcriptionHistory = state.$transcriptionHistory
-
-    return .run { send in
-      do {
-        try await finalizeRecordingAndStoreTranscript(
-          result: modifiedResult,
-          duration: duration,
-          sourceAppBundleID: sourceAppBundleID,
-          sourceAppName: sourceAppName,
-          audioURL: audioURL,
-          transcriptionHistory: transcriptionHistory
-        )
-      } catch {
-        await send(.transcriptionError(error, audioURL))
-      }
-    }
-    .cancellable(id: CancelID.transcription)
+    // Continue with storing the final result in the background
+    return finalizeRecordingAndStoreTranscript(
+      result: result,
+      duration: duration,
+      transcriptionHistory: state.$transcriptionHistory
+    )
   }
 
-  func handleTranscriptionError(
+  fileprivate func handleTranscriptionError(
     _ state: inout State,
-    error: Error,
-    audioURL: URL?
+    error: Error
   ) -> Effect<Action> {
     state.isTranscribing = false
     state.isPrewarming = false
     state.error = error.localizedDescription
-    
-    if let audioURL {
-      try? FileManager.default.removeItem(at: audioURL)
-    }
 
-    return .none
+    return .run { _ in
+      await soundEffect.play(.cancel)
+    }
   }
 
   /// Move file to permanent location, create a transcript record, paste text, and play sound.
-  func finalizeRecordingAndStoreTranscript(
+  fileprivate func finalizeRecordingAndStoreTranscript(
     result: String,
     duration: TimeInterval,
-    sourceAppBundleID: String?,
-    sourceAppName: String?,
-    audioURL: URL,
     transcriptionHistory: Shared<TranscriptionHistory>
-  ) async throws {
-    @Shared(.hexSettings) var hexSettings: HexSettings
+  ) -> Effect<Action> {
+    .run { send in
+      do {
+        let originalURL = await recording.stopRecording()
 
-    if hexSettings.saveTranscriptionHistory {
-      let transcript = try await transcriptPersistence.save(
-        result,
-        audioURL,
-        duration,
-        sourceAppBundleID,
-        sourceAppName
-      )
+        @Shared(.hexSettings) var hexSettings: HexSettings
 
-      transcriptionHistory.withLock { history in
-        history.history.insert(transcript, at: 0)
+        // Check if we should save to history
+        if hexSettings.saveTranscriptionHistory {
+          // Move the file to a permanent location
+          let fm = FileManager.default
+          let supportDir = try fm.url(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask,
+            appropriateFor: nil,
+            create: true
+          )
+          let ourAppFolder = supportDir.appendingPathComponent(
+            "com.kitlangton.Hex", isDirectory: true)
+          let recordingsFolder = ourAppFolder.appendingPathComponent(
+            "Recordings", isDirectory: true)
+          try fm.createDirectory(at: recordingsFolder, withIntermediateDirectories: true)
 
-        if let maxEntries = hexSettings.maxHistoryEntries, maxEntries > 0 {
-          while history.history.count > maxEntries {
-            if let removedTranscript = history.history.popLast() {
-              Task {
-                 try? await transcriptPersistence.deleteAudio(removedTranscript)
+          // Create a unique file name
+          let filename = "\(Date().timeIntervalSince1970).wav"
+          let finalURL = recordingsFolder.appendingPathComponent(filename)
+
+          // Move temp => final
+          try fm.moveItem(at: originalURL, to: finalURL)
+
+          // Build a transcript object
+          let transcript = Transcript(
+            timestamp: Date(),
+            text: result,
+            audioPath: finalURL,
+            duration: duration
+          )
+
+          // Append to the in-memory shared history
+          transcriptionHistory.withLock { history in
+            history.history.insert(transcript, at: 0)
+
+            // Trim history if max entries is set
+            if let maxEntries = hexSettings.maxHistoryEntries, maxEntries > 0 {
+              while history.history.count > maxEntries {
+                if let removedTranscript = history.history.popLast() {
+                  // Delete the audio file
+                  try? FileManager.default.removeItem(at: removedTranscript.audioPath)
+                }
               }
             }
           }
+        } else {
+          // If not saving history, just delete the temp audio file
+          try? FileManager.default.removeItem(at: originalURL)
         }
-      }
-    } else {
-      try? FileManager.default.removeItem(at: audioURL)
-    }
 
-    await pasteboard.paste(result)
-    soundEffect.play(.pasteTranscript)
+        // Paste text (and copy if enabled via pasteWithClipboard)
+        await pasteboard.paste(result)
+        await soundEffect.play(.pasteTranscript)
+      } catch {
+        await send(.transcriptionError(error))
+      }
+    }
   }
 }
 
-// MARK: - Cancel/Discard Handlers
+// MARK: - Cancel Handler
 
-private extension TranscriptionFeature {
-  func handleCancel(_ state: inout State) -> Effect<Action> {
+extension TranscriptionFeature {
+  fileprivate func handleCancel(_ state: inout State) -> Effect<Action> {
     state.isTranscribing = false
     state.isRecording = false
     state.isPrewarming = false
 
     return .merge(
       .cancel(id: CancelID.transcription),
-      .run { [sleepManagement] _ in
-        // Allow system to sleep again
-        await sleepManagement.allowSleep()
-        // Stop the recording to release microphone access
-        let url = await recording.stopRecording()
-        try? FileManager.default.removeItem(at: url)
-        soundEffect.play(.cancel)
+      .cancel(id: CancelID.delayedRecord),
+      .run { _ in
+        await soundEffect.play(.cancel)
       }
     )
   }
+}
 
-  func handleDiscard(_ state: inout State) -> Effect<Action> {
-    state.isRecording = false
-    state.isPrewarming = false
+// MARK: - System Sleep Prevention
 
-    // Silently discard - no sound effect
-    return .run { [sleepManagement] _ in
-      // Allow system to sleep again
-      await sleepManagement.allowSleep()
-      let url = await recording.stopRecording()
-      try? FileManager.default.removeItem(at: url)
+extension TranscriptionFeature {
+  fileprivate func preventSystemSleep(_ state: inout State) {
+    // Prevent system sleep during recording
+    let reasonForActivity = "Hex Voice Recording" as CFString
+    var assertionID: IOPMAssertionID = 0
+    let success = IOPMAssertionCreateWithName(
+      kIOPMAssertionTypeNoDisplaySleep as CFString,
+      IOPMAssertionLevel(kIOPMAssertionLevelOn),
+      reasonForActivity,
+      &assertionID
+    )
+    if success == kIOReturnSuccess {
+      state.assertionID = assertionID
+    }
+  }
+
+  fileprivate func reallowSystemSleep(_ state: inout State) {
+    if let assertionID = state.assertionID {
+      let releaseSuccess = IOPMAssertionRelease(assertionID)
+      if releaseSuccess == kIOReturnSuccess {
+        state.assertionID = nil
+      }
     }
   }
 }
@@ -577,22 +482,5 @@ struct TranscriptionView: View {
       await store.send(.task).finish()
     }
     .enableInjection()
-  }
-}
-
-// MARK: - Force Quit Command
-
-private enum ForceQuitCommandDetector {
-  static func matches(_ text: String) -> Bool {
-    let normalized = normalize(text)
-    return normalized == "force quit hex now" || normalized == "force quit hex"
-  }
-
-  private static func normalize(_ text: String) -> String {
-    text
-      .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
-      .components(separatedBy: CharacterSet.alphanumerics.inverted)
-      .filter { !$0.isEmpty }
-      .joined(separator: " ")
   }
 }
