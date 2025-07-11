@@ -11,6 +11,7 @@ class SignalHandler {
     static let shared = SignalHandler()
     private var shouldStop = false
     private var shouldSkipTranscription = false
+    private var silent = false
     private let queue = DispatchQueue(label: "signal-handler")
 
     // Keep references to prevent deallocation
@@ -22,30 +23,48 @@ class SignalHandler {
         setupSignalHandlers()
     }
 
+    func setSilent(_ silent: Bool) {
+        queue.sync {
+            self.silent = silent
+        }
+    }
+
     private func setupSignalHandlers() {
         let signalQueue = DispatchQueue(label: "signal-queue")
 
         // Handle SIGINT (Ctrl+C) - stops recording and exits without transcription
         sigintSource = DispatchSource.makeSignalSource(signal: SIGINT, queue: signalQueue)
         sigintSource?.setEventHandler { [weak self] in
-            print("\n🛑 Received SIGINT (Ctrl+C), stopping without transcription...")
-            self?.stopWithoutTranscription()
+            guard let self = self else { return }
+            let isSilent = self.queue.sync { self.silent }
+            if !isSilent {
+                print("\n🛑 Received SIGINT (Ctrl+C), stopping without transcription...")
+            }
+            self.stopWithoutTranscription()
         }
         sigintSource?.resume()
 
         // Handle SIGHUP - stops recording and transcribes what was recorded
         sighupSource = DispatchSource.makeSignalSource(signal: SIGHUP, queue: signalQueue)
         sighupSource?.setEventHandler { [weak self] in
-            print("\n🎙️ Received SIGHUP, stopping recording and transcribing...")
-            self?.stop()
+            guard let self = self else { return }
+            let isSilent = self.queue.sync { self.silent }
+            if !isSilent {
+                print("\n🎙️ Received SIGHUP, stopping recording and transcribing...")
+            }
+            self.stop()
         }
         sighupSource?.resume()
 
         // Handle SIGTERM (termination signal) - for clean shutdown
         sigtermSource = DispatchSource.makeSignalSource(signal: SIGTERM, queue: signalQueue)
         sigtermSource?.setEventHandler { [weak self] in
-            print("\n🛑 Received SIGTERM, stopping...")
-            self?.stop()
+            guard let self = self else { return }
+            let isSilent = self.queue.sync { self.silent }
+            if !isSilent {
+                print("\n🛑 Received SIGTERM, stopping...")
+            }
+            self.stop()
         }
         sigtermSource?.resume()
 
@@ -122,6 +141,9 @@ struct HexCLI: ParsableCommand {
     @Flag(name: .shortAndLong, help: "Verbose output")
     var verbose: Bool = false
 
+    @Flag(name: .shortAndLong, help: "Silent mode - only output transcription result")
+    var silent: Bool = false
+
     @Option(help: "Audio input device ID (default: system default)")
     var inputDevice: String?
 
@@ -171,7 +193,9 @@ struct HexCLI: ParsableCommand {
     }
 
     func listAudioDevicesSync() {
-        print("Available audio input devices:")
+        if !silent {
+            print("Available audio input devices:")
+        }
 
         // Simplified device listing
         let devices = getAllAudioDevices()
@@ -185,7 +209,9 @@ struct HexCLI: ParsableCommand {
     }
 
     func listWhisperModelsSync() {
-        print("Available Whisper models:")
+        if !silent {
+            print("Available Whisper models:")
+        }
 
         // Common Whisper models
         let commonModels = [
@@ -206,7 +232,9 @@ struct HexCLI: ParsableCommand {
             print("  ⬇️ \(model)")
         }
 
-        print("\nNote: Models will be downloaded automatically when first used.")
+        if !silent {
+            print("\nNote: Models will be downloaded automatically when first used.")
+        }
     }
 }
 
@@ -216,6 +244,9 @@ extension HexCLI {
     func performTranscription() async throws {
         let recorder = CLIRecordingClient()
         let transcription = CLITranscriptionClient()
+
+        // Configure signal handler for silent mode
+        SignalHandler.shared.setSilent(silent)
 
         // Request microphone permission
         let hasPermission = await recorder.requestMicrophoneAccess()
@@ -229,34 +260,42 @@ extension HexCLI {
         }
 
         // Download model if needed
-        if verbose {
+        if verbose && !silent {
             print("Checking model availability...")
         }
 
         let isDownloaded = await transcription.isModelDownloaded(model)
         if !isDownloaded {
-            print("Downloading model '\(model)'...")
+            if !silent {
+                print("Downloading model '\(model)'...")
+            }
             try await transcription.downloadModel(model) { progress in
-                if verbose {
+                if verbose && !silent {
                     print("Download progress: \(Int(progress.fractionCompleted * 100))%")
                 }
             }
         }
 
         // Start recording
-        print("🎤 Recording... (Press Ctrl+C to exit, or send SIGHUP to transcribe)")
+        if !silent {
+            print("🎤 Recording... (Press Ctrl+C to exit, or send SIGHUP to transcribe)")
+        }
 
         let audioURL = try await performRecording(recorder: recorder)
 
         // Check if we should skip transcription (Ctrl+C was pressed)
         if SignalHandler.shared.checkShouldSkipTranscription() {
-            print("🚫 Skipping transcription as requested")
+            if !silent {
+                print("🚫 Skipping transcription as requested")
+            }
             try? FileManager.default.removeItem(at: audioURL)
             return
         }
 
         // Transcribe
-        print("🔄 Transcribing...")
+        if !silent {
+            print("🔄 Transcribing...")
+        }
 
         let decodeOptions = DecodingOptions(
             language: language,
@@ -265,7 +304,7 @@ extension HexCLI {
 
         let result = try await transcription.transcribe(audioURL, model, decodeOptions) {
             progress in
-            if verbose {
+            if verbose && !silent {
                 print("Transcription progress: \(Int(progress.fractionCompleted * 100))%")
             }
         }
@@ -305,22 +344,32 @@ extension HexCLI {
     func outputResult(_ text: String) async throws {
         if let outputPath = output {
             try text.write(toFile: outputPath, atomically: true, encoding: .utf8)
-            print("✅ Transcription saved to: \(outputPath)")
+            if !silent {
+                print("✅ Transcription saved to: \(outputPath)")
+            }
         } else {
-            print("📝 Transcription:")
-            print(text)
+            if silent {
+                print(text)
+            } else {
+                print("📝 Transcription:")
+                print(text)
+            }
         }
 
         if clipboard {
             let pasteboard = NSPasteboard.general
             pasteboard.clearContents()
             pasteboard.setString(text, forType: NSPasteboard.PasteboardType.string)
-            print("📋 Copied to clipboard")
+            if !silent {
+                print("📋 Copied to clipboard")
+            }
         }
     }
 
     func listAudioDevices() async throws {
-        print("Available audio input devices:")
+        if !silent {
+            print("Available audio input devices:")
+        }
 
         // Simplified device listing
         let devices = getAllAudioDevices()
@@ -419,7 +468,9 @@ extension HexCLI {
     }
 
     func listWhisperModels() async throws {
-        print("Available Whisper models:")
+        if !silent {
+            print("Available Whisper models:")
+        }
 
         // Common Whisper models
         let commonModels = [
@@ -440,7 +491,9 @@ extension HexCLI {
             print("  ⬇️ \(model)")
         }
 
-        print("\nNote: Models will be downloaded automatically when first used.")
+        if !silent {
+            print("\nNote: Models will be downloaded automatically when first used.")
+        }
     }
 }
 
@@ -499,6 +552,8 @@ actor CLIRecordingClient {
             recorder = try AVAudioRecorder(url: recordingURL, settings: settings)
             recorder?.record()
         } catch {
+            // Note: We can't access the CLI's silent flag here, so we'll always print errors
+            // as they are important for debugging
             print("Could not start recording: \(error)")
         }
     }
