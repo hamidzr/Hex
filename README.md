@@ -1,5 +1,7 @@
 # Hex — Voice → Text
 
+This forks adds a cli companion currently in the `cli` branch here.
+
 Press-and-hold a hotkey to transcribe your voice and paste the result wherever you're typing.
 
 **[Download Hex for macOS](https://hex-updates.s3.us-east-1.amazonaws.com/hex-latest.dmg)**
