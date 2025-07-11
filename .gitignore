@@ -11,3 +11,4 @@ buildServer.json
 bin
 scripts
 ExportOptions.plist
+.build/
