@@ -14,7 +14,7 @@ struct TranscribeCommand: ParsableCommand {
     var audioFile: String
 
     @Option(name: .shortAndLong, help: "Whisper model to use")
-    var model: String = "openai_whisper-medium.en"
+    var model: String = "openai_whisper-large-v3-v20240930_turbo"
 
     @Option(name: .shortAndLong, help: "Language code for transcription")
     var language: String = "en"

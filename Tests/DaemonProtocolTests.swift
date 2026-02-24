@@ -188,6 +188,6 @@ final class DaemonProtocolTests: XCTestCase {
         let models = DaemonDefaults.defaultPreload
         XCTAssertEqual(models.count, 2)
         XCTAssertTrue(models.contains("openai_whisper-tiny.en"))
-        XCTAssertTrue(models.contains("openai_whisper-medium.en"))
+        XCTAssertTrue(models.contains("openai_whisper-large-v3-v20240930_turbo"))
     }
 }

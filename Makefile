@@ -25,7 +25,7 @@ build:
 # Install to system path
 install: build
 	@echo "Installing hex-cli to /usr/local/bin..."
-	sudo cp .build/release/hex-cli /usr/local/bin/
+	cp .build/release/hex-cli ~/.local/bin/
 	@echo "Installation complete! You can now use 'hex-cli' from anywhere."
 
 # Clean build artifacts
@@ -56,7 +56,7 @@ run:
 
 # Start daemon in foreground
 daemon: build
-	.build/release/hex-cli daemon --preload openai_whisper-tiny.en --preload openai_whisper-medium.en
+	.build/release/hex-cli daemon --preload openai_whisper-tiny.en --preload openai_whisper-large-v3-v20240930_turbo
 
 # Stop a running daemon
 daemon-stop:

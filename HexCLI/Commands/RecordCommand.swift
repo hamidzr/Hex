@@ -19,7 +19,7 @@ struct RecordCommand: ParsableCommand {
     var output: String?
 
     @Option(name: .shortAndLong, help: "Whisper model to use")
-    var model: String = "openai_whisper-large-v3-v20240930"
+    var model: String = "openai_whisper-large-v3-v20240930_turbo"
 
     @Option(name: .shortAndLong, help: "Language code for transcription (default: auto-detect)")
     var language: String?
@@ -210,6 +210,7 @@ struct RecordCommand: ParsableCommand {
             "openai_whisper-large-v2",
             "openai_whisper-large-v3",
             "openai_whisper-large-v3-v20240930",
+            "openai_whisper-large-v3-v20240930_turbo",
         ]
         for model in commonModels {
             print("  \(model)")
