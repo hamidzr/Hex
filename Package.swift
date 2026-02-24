@@ -4,7 +4,7 @@ import PackageDescription
 let package = Package(
     name: "HexCLI",
     platforms: [
-        .macOS(.v13)
+        .macOS(.v14)
     ],
     products: [
         .executable(
@@ -14,16 +14,21 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.2.0"),
-        .package(url: "https://github.com/argmaxinc/WhisperKit", from: "0.5.0")
+        .package(url: "https://github.com/argmaxinc/WhisperKit", from: "0.15.0"),
     ],
     targets: [
         .executableTarget(
             name: "HexCLI",
             dependencies: [
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
-                .product(name: "WhisperKit", package: "WhisperKit")
+                .product(name: "WhisperKit", package: "WhisperKit"),
             ],
             path: "HexCLI"
-        )
+        ),
+        .testTarget(
+            name: "HexCLITests",
+            dependencies: ["HexCLI"],
+            path: "Tests"
+        ),
     ]
 ) 
