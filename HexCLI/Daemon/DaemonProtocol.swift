@@ -10,7 +10,7 @@ enum DaemonDefaults {
 
     static let defaultPreload = [
         "openai_whisper-tiny.en",
-        "openai_whisper-large-v3-v20240930_turbo",
+        "distil-whisper_distil-large-v3_turbo",
     ]
 }
 

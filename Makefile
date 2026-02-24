@@ -56,7 +56,7 @@ run:
 
 # Start daemon in foreground
 daemon: build
-	.build/release/hex-cli daemon --preload openai_whisper-tiny.en --preload openai_whisper-large-v3-v20240930_turbo
+	.build/release/hex-cli daemon --preload openai_whisper-tiny.en --preload distil-whisper_distil-large-v3_turbo
 
 # Stop a running daemon
 daemon-stop:
